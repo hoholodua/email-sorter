@@ -1,19 +1,70 @@
 """
 Google Calendar интеграция — создание событий из писем.
-Парсит дату/время/место из текста письма (если есть) и создаёт событие в календаре.
+Парсит дату/время/место из текста письма через LLM (Ollama).
 
 Использует тот же OAuth-токен, что и Gmail API (с дополнительным scope).
 """
 
 from __future__ import annotations
 
-import re
 import json
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import requests
 from googleapiclient.discovery import build, Resource
+
 from auth import get_gmail_credentials
+from config import Config
+
+
+EVENT_PROMPT = """Extract event information from this email if it contains a meeting, appointment, deadline, or scheduled event.
+
+Look for:
+- Meeting/event title
+- Date and time
+- Duration (if mentioned)
+- Location or meeting link (Zoom, Google Meet, Teams, etc.)
+- Organizer
+
+Respond with JSON:
+{{"is_event": true, "title": "event title", "date": "YYYY-MM-DD or empty", "time": "HH:MM or empty", "duration_minutes": 60, "location": "address/URL or empty", "description": "brief note or empty"}}
+or
+{{"is_event": false}}
+
+Email:
+Subject: {subject}
+From: {sender}
+Body: {text}"""
+
+
+def _llm_extract_event(email_text: str, subject: str,
+                        sender: str) -> dict[str, Any] | None:
+    """Пытается извлечь данные о событии через LLM."""
+    try:
+        text_block = f"Subject: {subject}\nFrom: {sender}\nBody: {email_text[:2000]}"
+        prompt = EVENT_PROMPT.format(subject=subject, sender=sender, text=text_block)
+
+        resp = requests.post(
+            f"{Config.OLLAMA_URL}/api/generate",
+            json={
+                "model": Config.OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0.1,
+                "max_tokens": 200,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "").strip()
+        data = json.loads(raw)
+        if data.get("is_event"):
+            return data
+    except Exception:
+        pass
+    return None
 
 
 def get_calendar_service() -> Resource | None:
@@ -24,95 +75,80 @@ def get_calendar_service() -> Resource | None:
     return build("calendar", "v3", credentials=creds)
 
 
-def extract_event_info(email_text: str, subject: str) -> dict[str, Any] | None:
+def _parse_event_datetime(event_data: dict) -> tuple[dict, dict] | None:
     """
-    Пытается извлечь информацию о событии из письма.
-
-    Ищет:
-    - Дату/время в свободном формате
-    - Ссылки на встречи
-    - Место проведения
-
-    Возвращает {"summary", "description", "start", "end", "location"} или None.
+    Преобразует данные из LLM в start/end для Google Calendar API.
+    Возвращает (start, end) или None если дату определить не удалось.
     """
-    info: dict[str, Any] = {}
-    text_lower = email_text.lower()
+    date_str = event_data.get("date", "").strip()
+    time_str = event_data.get("time", "").strip()
+    duration = event_data.get("duration_minutes", 60)
+    if not isinstance(duration, (int, float)) or duration < 15:
+        duration = 60
 
-    # Ищем даты (грубый поиск)
-    date_patterns = [
-        r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})",
-        r"(\d{4})-(\d{1,2})-(\d{1,2})",
-        r"(понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея])",
-        r"(tomorrow|today|next week|next month)",
-        r"(\d{1,2}):(\d{2})\s*(am|pm)?",
-        r"(\d{1,2}):(\d{2})",
-    ]
+    now = datetime.now(timezone(timedelta(hours=3)))  # Moscow time
 
-    found_date = None
-    found_time = None
-    for pattern in date_patterns:
-        match = re.search(pattern, text_lower)
-        if match:
-            if re.match(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}", match.group()):
-                found_date = match.group()
-            elif ":" in match.group():
-                found_time = match.group()
-
-    # Ищем Zoom/Meet/Teams ссылки
-    link_patterns = [
-        r"https?://zoom\.us/[^\s<>]+",
-        r"https?://meet\.google\.com/[^\s<>]+",
-        r"https?://teams\.microsoft\.com/[^\s<>]+",
-    ]
-    links = []
-    for pattern in link_patterns:
-        links.extend(re.findall(pattern, email_text))
-
-    # Ищем локацию
-    location = ""
-    loc_patterns = [
-        r"(?:адрес|address|location|place|место)\s*[:\s]+([^\n.]+)",
-        r"(?:кабинет|офис|office|room)\s+([^\n.]+)",
-    ]
-    for pattern in loc_patterns:
-        match = re.search(pattern, email_text, re.IGNORECASE)
-        if match:
-            location = match.group(1).strip()
-            break
-
-    # Если ничего не нашли — не создаём событие
-    if not found_date and not links and not location:
+    if date_str:
+        # Пробуем разные форматы
+        for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d"]:
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            # Не смогли распарсить дату — игнорируем
+            return None
+    else:
+        # Даты нет — не создаём событие
         return None
 
-    info["summary"] = f"📧 {subject[:100]}"
-    info["description"] = f"Из письма: {subject}\n\n{email_text[:1000]}"
+    # Если время указано — ставим его, иначе all-day
+    if time_str:
+        try:
+            hour, minute = map(int, time_str.split(":"))
+            start_dt = dt.replace(hour=hour, minute=minute)
+        except (ValueError, TypeError):
+            start_dt = dt.replace(hour=10, minute=0)
+    else:
+        # All-day event
+        return (
+            {"date": dt.date().isoformat()},
+            {"date": (dt + timedelta(days=1)).date().isoformat()},
+        )
 
-    if links:
-        info["description"] += "\n\nСсылки:\n" + "\n".join(links)
+    end_dt = start_dt + timedelta(minutes=duration)
 
-    if location:
-        info["location"] = location
-
-    # Ставим событие на завтра (если дата не найдена) на 1 час
-    tomorrow = datetime.now() + timedelta(days=1)
-    start = tomorrow.replace(hour=10, minute=0, second=0, microsecond=0)
-    info["start"] = {"dateTime": start.isoformat(), "timeZone": "Europe/Moscow"}
-    info["end"] = {"dateTime": (start + timedelta(hours=1)).isoformat(), "timeZone": "Europe/Moscow"}
-
-    return info
+    tz = "Europe/Moscow"
+    return (
+        {"dateTime": start_dt.isoformat(), "timeZone": tz},
+        {"dateTime": end_dt.isoformat(), "timeZone": tz},
+    )
 
 
-def create_event(service: Resource, event_info: dict[str, Any]) -> bool:
+def create_event(service: Resource, event_info: dict[str, Any],
+                 event_data: dict[str, Any] | None = None) -> bool:
     """Создаёт событие в календаре. Возвращает True при успехе."""
     try:
         body = {
-            "summary": event_info["summary"],
+            "summary": event_info.get("summary", "Событие"),
             "description": event_info.get("description", ""),
-            "start": event_info.get("start"),
-            "end": event_info.get("end"),
         }
+        if event_info.get("start"):
+            body["start"] = event_info["start"]
+        if event_info.get("end"):
+            body["end"] = event_info["end"]
         if event_info.get("location"):
             body["location"] = event_info["location"]
+
+        # Добавляем напоминание за 30 минут
+        body["reminders"] = {
+            "useDefault": False,
+            "overrides": [
+                {"method": "popup", "minutes": 30},
+                {"method": "email", "minutes": 30},
+            ],
+        }
 
         service.events().insert(calendarId="primary", body=body).execute()
         return True
@@ -121,27 +157,72 @@ def create_event(service: Resource, event_info: dict[str, Any]) -> bool:
         return False
 
 
-def try_create_event_from_email(email_text: str, subject: str, sender: str) -> bool:
+def try_create_event_from_email(email_text: str, subject: str,
+                                 sender: str) -> bool:
     """
     Пытается создать событие в календаре из письма.
-    Возвращает True если событие создано.
+    Использует LLM для извлечения данных о событии.
+
+    Returns:
+        True если событие создано.
     """
-    event_info = extract_event_info(email_text, subject)
-    if not event_info:
+    # Пропускаем не-событийные письма по ключевым словам
+    text_lower = f"{subject} {email_text[:500]}".lower()
+    event_keywords = [
+        "meeting", "встреч", "созвон", "конференц", "call",
+        "встретиться", "appointment", "deadline", "дедлайн",
+        "reminder", "напомина", "webinar", "вебинар",
+        "interview", "собеседова", "workshop", "воркшоп",
+        "мероприят", "event", "приглаш",
+    ]
+    if not any(kw in text_lower for kw in event_keywords):
         return False
+
+    # Пропускаем рассылки
+    spammy_domains = [
+        "mailgun.org", "sendgrid.net", "substack.com",
+        "mailchimp.com", "constantcontact.com", "marketo.com",
+    ]
+    for d in spammy_domains:
+        if d in sender.lower():
+            return False
+
+    # LLM-извлечение
+    event_data = _llm_extract_event(email_text, subject, sender)
+    if not event_data:
+        return False
+
+    title = event_data.get("title", "").strip() or subject[:100]
+    location = event_data.get("location", "") or ""
+    description = event_data.get("description", "") or ""
+
+    # Парсим дату/время
+    times = _parse_event_datetime(event_data)
+    if not times:
+        return False
+
+    start, end = times
+    event_info = {
+        "summary": f"📧 {title[:100]}",
+        "description": (
+            f"Из письма: {subject}\n"
+            f"От: {sender}\n\n"
+            f"{description}\n\n"
+            f"---\n{email_text[:500]}"
+        ),
+        "start": start,
+        "end": end,
+    }
+    if location:
+        event_info["location"] = location
 
     service = get_calendar_service()
     if not service:
         return False
 
-    # Проверяем, что письмо не от рассылки (для них не создаём события)
-    spammy_domains = ["mailgun.org", "sendgrid.net", "substack.com", "mailchimp.com",
-                       "constantcontact.com", "marketo.com"]
-    for d in spammy_domains:
-        if d in sender.lower():
-            return False
-
-    if create_event(service, event_info):
-        print(f"  📅 Событие создано: {event_info['summary']}")
+    if create_event(service, event_info, event_data):
+        # Показываем человеку, что создали
+        date_str = start.get("date", start.get("dateTime", "?"))
+        print(f"  📅 Событие создано: {title[:60]} — {date_str}")
         return True
     return False
