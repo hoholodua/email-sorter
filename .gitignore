@@ -1,0 +1,7 @@
+venv/
+.env
+credentials/*.json
+__pycache__/
+*.pyc
+data/
+.dry-run.json
